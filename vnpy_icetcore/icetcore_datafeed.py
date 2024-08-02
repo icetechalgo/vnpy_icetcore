@@ -1,217 +1,136 @@
 from datetime import datetime, timedelta
-from typing import Dict, List,  Optional, Callable
+from typing import Optional, Callable
 
-from numpy import ndarray
 from icetcore import TCoreAPI
 
 from vnpy.trader.setting import SETTINGS
-from vnpy.trader.constant import Exchange, Interval,Product
-from vnpy.trader.object import BarData, TickData, HistoryRequest,ContractData
+from vnpy.trader.constant import Exchange, Interval
+from vnpy.trader.object import BarData, HistoryRequest, TickData
 from vnpy.trader.utility import ZoneInfo
 from vnpy.trader.datafeed import BaseDatafeed
 
-from .icetcore_gateway import symbol_contract_map,EXCHANGE_VT2ICE,EXCHANGE_ICE2VT
 
-INTERVAL_VT2ICE: Dict[Interval, int] = {
-    Interval.TICK: 2,
-    Interval.MINUTE: 4,
-    Interval.DAILY: 5,
+INTERVAL_VT2ICE: dict[Interval, tuple] = {
+    Interval.MINUTE: (4, 1),
+    Interval.HOUR: (4, 60),
+    Interval.DAILY: (5, 1)
 }
 
-INTERVAL_ADJUSTMENT_MAP: Dict[Interval, timedelta] = {
+INTERVAL_ADJUSTMENT_MAP: dict[Interval, timedelta] = {
     Interval.MINUTE: timedelta(minutes=1),
-    Interval.TICK: timedelta(),
-    Interval.DAILY: timedelta()         # no need to adjust for daily bar
+    Interval.HOUR: timedelta(hours=1),
+    Interval.DAILY: timedelta()
 }
 
-
+# 交易所映射
+EXCHANGE_ICE2VT: dict[str, Exchange] = {
+    "CFFEX": Exchange.CFFEX,
+    "SHFE": Exchange.SHFE,
+    "CZCE": Exchange.CZCE,
+    "DCE": Exchange.DCE,
+    "INE": Exchange.INE,
+    "GFEX": Exchange.GFEX,
+    "SSE": Exchange.SSE,
+    "SZSE": Exchange.SZSE,
+}
+EXCHANGE_VT2ICE: dict[Exchange, str] = {v: k for k, v in EXCHANGE_ICE2VT.items()}
 
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
 
+
 class IceTCoreDatafeed(BaseDatafeed):
-    exchanges: List[str] = list(EXCHANGE_ICE2VT.values())
+    """"""
 
     def __init__(self):
         """"""
         if "datafeed.apppath" not in SETTINGS.keys():
-            SETTINGS["datafeed.apppath"]="C:/AlgoMaster2/APPs64"
+            SETTINGS["datafeed.apppath"] = "C:/AlgoMaster2/APPs64"
         self.username: str = SETTINGS["datafeed.apppath"]
-        self.api: "TCoreAPI" =None
+
         self.inited: bool = False
-        self.symbols: ndarray = None
+
+        self.api: "TCoreAPI" = None
+        self.symbol_name_map: dict[str, str] = {}
 
     def init(self, output: Callable = print) -> bool:
         """初始化"""
         if self.inited:
             return True
-        self.api=TCoreAPI(apppath=self.username)
+
+        self.api = TCoreAPI(apppath=self.username)
         self.api.connect()
+
+        self.query_symbols()
         self.inited = True
+
         return True
 
+    def query_symbols(self) -> None:
+        """查询合约"""
+        for exchange_str in EXCHANGE_ICE2VT.keys():
+            symbols: list = self.api.getallsymbol(exchange=exchange_str)
+            for symbol_str in symbols:
 
-    def write_error(self, msg: str, error: dict) -> None:
-        """输出错误信息日志"""
-        error_id: int = error["ErrorID"]
-        error_msg: str = error["ErrorMsg"]
-        msg: str = f"{msg}，代码：{error_id}，信息：{error_msg}"
-        self.write_log(msg)
+                if "/" in symbol_str or "HOT" in symbol_str or "_" in symbol_str:    # 没有过滤期货指数合约
+                    continue
 
-    def query_bar_history(self, req: HistoryRequest, output: Callable = print) -> Optional[List[BarData]]:
+                symbol_id: str = self.api.getsymbol_id(symbol_str)
+                self.symbol_name_map[symbol_id] = symbol_str
+
+    def query_bar_history(self, req: HistoryRequest, output: Callable = print) -> Optional[list[BarData]]:
+        """查询K线数据"""
         if not self.inited:
             n: bool = self.init(output)
             if not n:
                 return []
 
-        symbol: str = req.symbol
-        exchange: Exchange = req.exchange
-        interval: Interval = req.interval
-        start: datetime = req.start
-        end: datetime = req.end
-        # start: str = req.start.strftime('%Y%m%d%H')
-        # end: str = req.end.strftime('%Y%m%d%H')
-
-        contract: ContractData = symbol_contract_map.get(EXCHANGE_VT2ICE[req.exchange]+"."+req.symbol, None)
-        # 检查查询的代码在范围内
-        if not contract:
+        name: str = self.symbol_name_map.get(req.symbol, None)
+        if not name:
             output(f"查询K线数据失败：不支持的合约代码{req.vt_symbol}")
             return []
 
-        rq_interval: int = INTERVAL_VT2ICE.get(interval)
-        if not rq_interval:
+        interval, window = INTERVAL_VT2ICE.get(req.interval, ("", ""))
+        if not interval:
             output(f"查询K线数据失败：不支持的时间周期{req.interval.value}")
             return []
-        #print(symbol,"  ",exchange,"  ",interval,"  ",start,"  ",end,"  ",contract.name)
-        symbolhead="TC.S."
-        if contract.product==Product.FUTURES:
-            symbolhead="TC.F."
-        elif contract.product==Product.OPTION:
-            symbolhead="TC.O." 
 
-        adjustment: timedelta = INTERVAL_ADJUSTMENT_MAP[interval]
+        adjustment: timedelta = INTERVAL_ADJUSTMENT_MAP[req.interval]
 
-        # 只对衍生品合约才查询持仓量数据
-        fields: list = ["open", "high", "low", "close", "volume"]
-        if symbolhead=="TC.F." or symbolhead=="TC.O.":
-            fields.append("open_interest")
+        quote_history: list = self.api.getquotehistory(
+            interval,
+            window,
+            name,
+            req.start.strftime("%Y%m%d%H"),
+            req.end.strftime("%Y%m%d%H")
+        )
 
-        stime=start.date()
-        df=[]
-        if rq_interval<5:
-            while(True):
-                if stime<end.date()+timedelta(days=1):
-                    his=self.api.getquotehistory(rq_interval,1,symbolhead+contract.name,stime.strftime('%Y%m%d')+"01",(stime+timedelta(days=1)).strftime('%Y%m%d')+"08")
-                    if his:
-                        df=df+his
-                    stime=stime+timedelta(days=1)
-                else:
-                    break
-        else:
-            df=self.api.getquotehistory(rq_interval,1,symbolhead+contract.name,stime.strftime('%Y%m%d')+"01",(end+timedelta(days=2)).date().strftime('%Y%m%d')+"08")
-        data: List[BarData] = []
-        if df:
-            for row in df:
-                dt: datetime = (row["DateTime"]- adjustment).replace(tzinfo=CHINA_TZ)
-                bar: BarData = BarData(
-                    symbol=symbol,
-                    exchange=exchange,
-                    interval=interval,
-                    datetime=dt,
-                    open_price=row["Open"],
-                    high_price=row["High"],
-                    low_price=row["Low"],
-                    close_price=row["Close"],
-                    volume=row["Volume"],
-                    open_interest=row["OpenInterest"],
-                    gateway_name="ICETCore"
-                )
-                data.append(bar)
-        return data
+        if not quote_history:
+            self.output(f"获取{req.symbol}合约{req.start}-{req.end}历史数据失败")
+            return []
 
-    def query_tick_history(self, req: HistoryRequest, output: Callable = print) -> Optional[List[TickData]]:
+        bars: list[BarData] = []
+        for history in quote_history:
+            dt: datetime = (history["DateTime"] - adjustment).replace(tzinfo=CHINA_TZ)
+            if req.interval == Interval.DAILY:
+                dt = dt.replace(hour=0, minute=0)
+
+            bar: BarData = BarData(
+                symbol=req.symbol,
+                exchange=req.exchange,
+                interval=req.interval,
+                datetime=dt,
+                open_price=history["Open"],
+                high_price=history["High"],
+                low_price=history["Low"],
+                close_price=history["Close"],
+                volume=history["Volume"],
+                open_interest=history["OpenInterest"],
+                gateway_name="ICETCORE"
+            )
+            bars.append(bar)
+
+        return bars
+
+    def query_tick_history(self, req: HistoryRequest, output: Callable = print) -> Optional[list[TickData]]:
         """查询Tick数据"""
-        if not self.inited:
-            n: bool = self.init(output)
-            if not n:
-                return []
-
-        symbol: str = req.symbol
-        exchange: Exchange = req.exchange
-        interval: Interval = req.interval
-        start: datetime = req.start
-        end: datetime = req.end
-        # start: str = req.start.strftime('%Y%m%d%H')
-        # end: str = req.end.strftime('%Y%m%d%H')
-
-        contract: ContractData = symbol_contract_map.get(EXCHANGE_VT2ICE[req.exchange]+"."+req.symbol, None)
-        # 检查查询的代码在范围内
-        if not contract:
-            output(f"查询K线数据失败：不支持的合约代码{req.vt_symbol}")
-            return []
-
-        rq_interval: int = INTERVAL_VT2ICE.get(interval)
-        if not rq_interval:
-            output(f"查询K线数据失败：不支持的时间周期{req.interval.value}")
-            return []
-        #print(symbol,"  ",exchange,"  ",interval,"  ",start,"  ",end,"  ",contract.name)
-        symbolhead="TC.S."
-        if contract.product==Product.FUTURES:
-            symbolhead="TC.F."
-        elif contract.product==Product.OPTION:
-            symbolhead="TC.O." 
-
-        adjustment: timedelta = INTERVAL_ADJUSTMENT_MAP[interval]
-
-        # 只对衍生品合约才查询持仓量数据
-
-        fields: list = [
-            "open",
-            "high",
-            "low",
-            "last",
-            "volume",
-            "b1",
-            "a1",
-            "b1_v",
-            "a1_v"]
-        if symbolhead=="TC.F." or symbolhead=="TC.O.":
-            fields.append("open_interest")
-
-        stime=start.date()
-        df=[]
-        while(True):
-            if stime<end.date():
-                print()
-                his=self.api.getquotehistory(rq_interval,1,symbolhead+contract.name,stime.strftime('%Y%m%d')+"10",(stime+timedelta(days=1)).strftime('%Y%m%d')+"10")
-                if his:
-                    df=df+his
-                stime=stime+timedelta(days=1)
-            else:
-                break
-        #df=self.api.getquotehistory(rq_interval,1,symbolhead+contract.name,start,end)
-        data: List[TickData] = []
-        if df:
-            for row in df:
-                dt: datetime = row["DateTime"].replace(tzinfo=CHINA_TZ)
-
-                tick: TickData = TickData(
-                    symbol=symbol,
-                    exchange=exchange,
-                    datetime=dt,
-                    open_price=row["Last"],
-                    high_price=row["Last"],
-                    low_price=row["Last"],
-                    last_price=row["Last"],
-                    volume=row["Quantity"],
-                    open_interest=row["OpenInterest"],
-                    bid_price_1=row["Bid"],
-                    ask_price_1=row["Ask"],
-                    bid_volume_1=row["OpenInterest"],
-                    ask_volume_1=row["OpenInterest"],
-
-                    gateway_name="ICETCore"
-                )
-
-                data.append(tick)
-
-        return data
+        return []
